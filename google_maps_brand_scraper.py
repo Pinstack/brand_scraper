@@ -22,7 +22,8 @@ import time
 from typing import List, Optional
 
 from playwright.sync_api import sync_playwright, Browser
-from google_maps_session_manager import GoogleMapsSessionManager
+from google_maps_session_manager_v2 import GoogleMapsSessionManager
+from proxy_manager import create_default_proxy_manager, ProxyManager
 
 
 class GoogleMapsBrandScraper:
@@ -34,7 +35,7 @@ class GoogleMapsBrandScraper:
     brand extraction logic.
     """
 
-    def __init__(self, headless: bool = True, timeout: int = 30000):
+    def __init__(self, headless: bool = True, timeout: int = 30000, use_proxies: bool = False, proxy_manager: Optional[ProxyManager] = None):
         """
         Initialize the brand scraper.
 
@@ -45,6 +46,8 @@ class GoogleMapsBrandScraper:
         self.headless = headless
         self.timeout = timeout
         self.logger = logging.getLogger(__name__)
+        self.use_proxies = use_proxies
+        self.proxy_manager = proxy_manager
 
         # Configure logging
         if not self.logger.handlers:
@@ -67,11 +70,15 @@ class GoogleMapsBrandScraper:
         self.logger.info(f"Starting brand scrape for URL: {url}")
 
         # Use session manager for authenticated browsing
-        session_manager = GoogleMapsSessionManager(headless=self.headless)
+        session_manager = GoogleMapsSessionManager(
+            headless=self.headless,
+            proxy_manager=(self.proxy_manager if self.use_proxies else None),
+            max_auth_attempts=(1 if self.use_proxies else 3),
+        )
 
         try:
             # Get authenticated page
-            page = session_manager.get_authenticated_page()
+            page = session_manager.get_authenticated_page(target_url=url)
 
             # Navigate to target URL
             page.goto(url, wait_until="domcontentloaded")
@@ -302,6 +309,7 @@ def main():
     parser.add_argument('--output', '-o', help='Output JSON file (optional)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     parser.add_argument('--headed', action='store_true', help='Run browser in headed mode (visible)')
+    parser.add_argument('--use-proxies', action='store_true', help='Enable proxy rotation via ProxyManager')
 
     args = parser.parse_args()
 
@@ -312,7 +320,8 @@ def main():
         logging.basicConfig(level=logging.INFO)
 
     # Create scraper
-    scraper = GoogleMapsBrandScraper(headless=not args.headed)
+    proxy_mgr = create_default_proxy_manager() if args.use_proxies else None
+    scraper = GoogleMapsBrandScraper(headless=not args.headed, use_proxies=args.use_proxies, proxy_manager=proxy_mgr)
 
     # Scrape brands
     brands = scraper.scrape_brands(args.url)
