@@ -22,7 +22,7 @@ import time
 from typing import List, Optional
 
 from playwright.sync_api import sync_playwright, Browser
-from google_maps_session_manager_v2 import GoogleMapsSessionManager
+from google_maps_session_manager import GoogleMapsSessionManager
 from proxy_manager import create_default_proxy_manager, ProxyManager
 
 

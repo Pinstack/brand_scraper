@@ -4,10 +4,20 @@ A modular Python system for scraping brand/store information from Google Maps bu
 
 ## Architecture
 
-The system is split into two focused modules:
+The system is split into three focused modules:
 
-1. **`google_consent_handler.py`** - Handles Google consent/privacy pages
-2. **`google_maps_brand_scraper.py`** - Performs the actual brand scraping
+1. **`google_consent_handler.py`** – Handles Google consent/privacy pages
+2. **`google_maps_session_manager.py`** – Manages Playwright sessions, including proxy-aware flows
+3. **`google_maps_brand_scraper.py`** – Performs the actual brand scraping and orchestration
+
+### Session Manager Highlights
+
+The session manager supports two execution paths:
+
+- **Proxy mode** – Lightweight flow that launches a fresh browser per proxy attempt and handles consent inline
+- **Non-proxy mode** – Legacy persistent-context flow with storage-state reuse
+
+This keeps the project DRY by centralising session logic in a single module.
 
 ## Features
 
@@ -45,12 +55,10 @@ The system is split into two focused modules:
 ### As Python Modules
 
 ```python
-from google_consent_handler import GoogleConsentHandler
 from google_maps_brand_scraper import GoogleMapsBrandScraper
 
-# Create handlers
-consent_handler = GoogleConsentHandler()
-scraper = GoogleMapsBrandScraper()
+# Create scraper (use_proxies=True enables proxy-integrated session manager)
+scraper = GoogleMapsBrandScraper(use_proxies=True)
 
 # Scrape brands from a Google Maps URL
 brands = scraper.scrape_brands("https://maps.app.goo.gl/FsGevWWrjvab4tZ9A")
@@ -90,6 +98,8 @@ python google_maps_brand_scraper.py "https://maps.app.goo.gl/FsGevWWrjvab4tZ9A" 
 7. **Deduplication**: Removes duplicate brand names
 8. **Results Output**: Returns sorted list of unique brand names
 
+When proxies are enabled, `google_maps_session_manager.py` handles proxy acquisition, consent, and retries automatically.
+
 ## Supported URL Formats
 
 - **Google Maps Short Links**: `https://maps.app.goo.gl/FsGevWWrjvab4tZ9A`
@@ -124,10 +134,13 @@ Results are saved as JSON with the following structure:
 
 ### Constructor Options
 
+Use CLI flags or constructor parameters on `GoogleMapsBrandScraper`:
+
 ```python
-scraper = GoogleMapsScraper(
-    headless=True,    # Run browser in headless mode (default: True)
-    timeout=30000     # Element operation timeout in milliseconds (default: 30000)
+scraper = GoogleMapsBrandScraper(
+    headless=True,     # Run browser in headless mode (default: True)
+    timeout=30000,     # Element operation timeout in milliseconds
+    use_proxies=True,  # Enable proxy rotation via ProxyManager
 )
 ```
 
@@ -155,8 +168,9 @@ logging.basicConfig(level=logging.INFO)  # or logging.DEBUG for verbose output
    - Try running with verbose logging: `--verbose`
 
 3. **Consent page issues**
-   - The module handles most consent scenarios automatically
+   - The session manager handles most consent scenarios automatically
    - If manual intervention is required, run with `--headed` flag
+   - For more detail, see `docs/PROXY_NAVIGATION_FIX.md`
 
 ### Browser Dependencies
 
@@ -177,9 +191,9 @@ python google_maps_scraper.py "https://maps.app.goo.gl/FsGevWWrjvab4tZ9A" --outp
 ### Scrape Multiple Locations
 
 ```python
-from google_maps_scraper import GoogleMapsScraper
+from google_maps_brand_scraper import GoogleMapsBrandScraper
 
-scraper = GoogleMapsScraper()
+scraper = GoogleMapsBrandScraper(use_proxies=True)
 locations = [
     "https://maps.app.goo.gl/FsGevWWrjvab4tZ9A",  # St James Quarter
     "https://maps.app.goo.gl/ABC123",            # Another mall

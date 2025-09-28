@@ -16,10 +16,9 @@ Usage:
 import json
 import logging
 import os
-import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional, Dict
+from typing import Optional
 
 from playwright.sync_api import (
     sync_playwright,
@@ -28,38 +27,39 @@ from playwright.sync_api import (
     Page,
     TimeoutError,
 )
+from proxy_manager import ProxyManager
 
 
 class GoogleMapsSessionManager:
     """
     Manages Google Maps browser sessions with consent handling and cookie persistence.
 
-    This class handles the initial consent flow and saves the authenticated state
-    so it can be reused for multiple scraping operations.
+    Key features:
+    - Simplified proxy support that bypasses complex session management
+    - Backwards-compatible flow for non-proxy sessions
+    - Automatic consent handling and optional storage-state persistence
+    - Helper methods for recaptcha detection and graceful cleanup
     """
 
-    def __init__(self, headless: bool = False, user_data_dir: Optional[str] = None, proxy_manager: Optional[object] = None, max_auth_attempts: int = 3):
-        """
-        Initialize the session manager.
-
-        Args:
-            headless: Whether to run browser in headless mode (default: False for consent handling)
-            user_data_dir: Directory to store browser data/cookies (optional)
-        """
+    def __init__(
+        self,
+        headless: bool = False,
+        user_data_dir: Optional[str] = None,
+        proxy_manager: Optional[ProxyManager] = None,
+        max_auth_attempts: int = 2,
+    ):
+        """Initialise the session manager."""
         self.headless = headless
-        default_session_dir = Path.cwd() / ".gmaps_session"
-        self._base_session_dir = Path(user_data_dir) if user_data_dir else Path.cwd() / ".gmaps_sessions"
+        self._base_session_dir = Path(user_data_dir or ".gmaps_sessions")
         self._base_session_dir.mkdir(parents=True, exist_ok=True)
-        self.user_data_dir_path = self._base_session_dir / "default"
-        self.user_data_dir_path.mkdir(parents=True, exist_ok=True)
-        self.storage_state_path = self.user_data_dir_path / "storage_state.json"
+        self.user_data_dir_path: Path = self._base_session_dir / "default"
+        self.storage_state_path: Path = self.user_data_dir_path / "storage_state.json"
         self.logger = logging.getLogger(__name__)
         self.proxy_manager = proxy_manager
-        self.max_auth_attempts = max(1, int(max_auth_attempts))
+        self._current_proxy_info = None
+        self.max_auth_attempts = max_auth_attempts
         self._recaptcha_detected = False
-        self._current_proxy_info: Optional[Dict[str, Any]] = None
 
-        # Configure logging
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -72,23 +72,96 @@ class GoogleMapsSessionManager:
         self._context: Optional[BrowserContext] = None
 
     def get_authenticated_page(self, target_url: Optional[str] = None) -> Page:
-        """
-        Get a Playwright page that is navigated to the target URL with consent handled.
-
-        Args:
-            target_url: Desired Google Maps URL. Defaults to Google Maps home.
-
-        Returns:
-            Authenticated Page object ready for scraping
-        """
+        """Return a page that is navigated to ``target_url`` with consent handled."""
+        target_url = target_url or "https://www.google.com/maps"
         self.logger.info("Getting authenticated Google Maps page...")
 
-        target_url = target_url or "https://www.google.com/maps"
+        if self.proxy_manager:
+            return self._get_page_with_proxy_simple(target_url)
 
-        # Start browser with persistent context
+        return self._get_page_with_session_management(target_url)
+
+    def _get_page_with_proxy_simple(self, target_url: str) -> Page:
+        """Simplified proxy flow that launches a fresh browser per attempt."""
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.max_auth_attempts + 1):
+            proxy = self.proxy_manager.get_working_proxy(max_attempts=3)
+            if not proxy:
+                break
+
+            self._current_proxy_info = proxy
+            proxy_config = {
+                "server": f"http://{proxy['ip']}:{proxy['port']}",
+                "username": proxy.get("username"),
+                "password": proxy.get("password"),
+            }
+            self.logger.info(
+                "Proxy attempt %s/%s using %s:%s",
+                attempt,
+                self.max_auth_attempts,
+                proxy["ip"],
+                proxy["port"],
+            )
+
+            try:
+                if self._playwright is None:
+                    self._playwright = sync_playwright().start()
+
+                self._browser = self._playwright.chromium.launch(
+                    headless=self.headless,
+                    proxy=proxy_config,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security',
+                        '--disable-features=VizDisplayCompositor',
+                    ],
+                )
+
+                self._context = self._browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-GB",
+                    timezone_id="Europe/London",
+                )
+
+                page = self._context.new_page()
+                self.logger.info("Navigating to: %s", target_url)
+                start_time = time.time()
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                elapsed = time.time() - start_time
+                self.logger.info("Navigation completed in %.1fs", elapsed)
+
+                if "consent.google.com" in page.url:
+                    self.logger.info("Consent page detected, handling...")
+                    self._handle_consent_simple(page)
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+
+                self.logger.info("Final URL: %s", page.url)
+                self.logger.info("Page title: %s", page.title())
+                self.proxy_manager.record_success(proxy)
+                return page
+
+            except Exception as exc:
+                last_error = exc
+                self.logger.error("Proxy navigation failed: %s", exc)
+                if self._current_proxy_info:
+                    self.proxy_manager.record_failure(self._current_proxy_info, block=True)
+                self.cleanup()
+                continue
+
+        raise last_error or Exception("Unable to load target URL with available proxies")
+
+    def _get_page_with_session_management(self, target_url: str) -> Page:
+        """Original persistent-session flow used when no proxy manager is supplied."""
         self._start_browser()
 
-        # Create or load authenticated context
         if self._is_authenticated():
             self.logger.info("Using existing authenticated session")
         else:
@@ -99,16 +172,9 @@ class GoogleMapsSessionManager:
                     self._setup_authentication()
                     last_error = None
                     break
-                except Exception as e:
-                    last_error = e
-                    self.logger.warning(f"Auth attempt {attempt+1}/{self.max_auth_attempts} failed: {e}")
-                    # Rotate proxy and restart if available
-                    if self.proxy_manager:
-                        try:
-                            self.proxy_manager.get_next_proxy()
-                        except Exception:
-                            pass
-                    # Restart browser/context for a clean retry
+                except Exception as exc:
+                    last_error = exc
+                    self.logger.warning("Auth attempt %s/%s failed: %s", attempt + 1, self.max_auth_attempts, exc)
                     try:
                         self.cleanup()
                     except Exception:
@@ -117,11 +183,10 @@ class GoogleMapsSessionManager:
             if last_error:
                 raise last_error
 
-        # Create a fresh page in the authenticated context and navigate to target
         page = self._context.new_page()
         try:
             self._setup_consent_handler(page)
-            self.logger.info(f"Navigating to target URL {target_url}")
+            self.logger.info("Navigating to target URL %s", target_url)
             page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             if "consent.google.com" in page.url:
                 self.logger.info("Consent page detected after navigation")
@@ -130,28 +195,45 @@ class GoogleMapsSessionManager:
                 try:
                     page.wait_for_load_state("networkidle", timeout=20000)
                     page.wait_for_timeout(1000)
-                    if self.proxy_manager and self._current_proxy_info:
-                        self.proxy_manager.record_success(self._current_proxy_info)
                 except TimeoutError:
                     pass
-        except Exception as e:
-            self.logger.error(f"Failed to load target URL {target_url}: {e}")
-            if self.proxy_manager and self._current_proxy_info:
-                self.proxy_manager.record_failure(self._current_proxy_info, block=True)
+        except Exception as exc:
+            self.logger.error("Failed to load target URL %s: %s", target_url, exc)
             raise
         return page
 
+    def _handle_consent_simple(self, page: Page):
+        """Handle Google consent page using a lightweight strategy."""
+        selectors = [
+            'button:has-text("Accept all")',
+            'button:has-text("I agree")',
+            '[aria-label*="Accept"]',
+            'button[jslog*="103597"]',
+        ]
+
+        for selector in selectors:
+            try:
+                button = page.locator(selector).first
+                if button.is_visible(timeout=5000):
+                    button.click()
+                    self.logger.info("Clicked consent button: %s", selector)
+                    break
+            except Exception:
+                continue
+
+        try:
+            page.wait_for_url(lambda url: "consent.google.com" not in url, timeout=15000)
+            self.logger.info("Successfully navigated away from consent page")
+        except Exception:
+            self.logger.warning("Still on consent page after attempting acceptance")
+
     def _start_browser(self):
         """Start the browser with persistent context."""
-        # Ensure user data directory exists
         Path(self.user_data_dir_path).mkdir(parents=True, exist_ok=True)
 
-        # Start playwright if not already started
         if self._playwright is None:
             self._playwright = sync_playwright().start()
 
-        # Optional proxy configuration
-        proxy_kwargs = {}
         proxy_kwargs = {}
         if self.proxy_manager:
             try:
@@ -165,28 +247,25 @@ class GoogleMapsSessionManager:
                             "password": proxy.get("password"),
                         }
                     }
-                    self.logger.info(f"Using proxy {proxy['ip']}:{proxy['port']}")
-                    # Use dedicated session directory per proxy
+                    self.logger.info("Using proxy %s:%s", proxy["ip"], proxy["port"])
                     proxy_dir = self._base_session_dir / proxy["slug"]
                     proxy_dir.mkdir(parents=True, exist_ok=True)
                     self.user_data_dir_path = proxy_dir
                     self.storage_state_path = proxy_dir / "storage_state.json"
-            except Exception as e:
-                self.logger.warning(f"Proxy setup failed, continuing without proxy: {e}")
+            except Exception as exc:
+                self.logger.warning("Proxy setup failed, continuing without proxy: %s", exc)
                 self._current_proxy_info = None
 
-        # Launch browser
         self._browser = self._playwright.chromium.launch(
             headless=self.headless,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
+                '--disable-features=VizDisplayCompositor',
             ],
             **proxy_kwargs,
         )
 
-        # Create persistent context (load storage state if present)
         storage_state = self.storage_state_path if self.storage_state_path.exists() else None
 
         self._context = self._browser.new_context(
@@ -200,15 +279,8 @@ class GoogleMapsSessionManager:
         )
 
     def _is_authenticated(self) -> bool:
-        """
-        Check if we already have an authenticated session.
-
-        Returns:
-            True if authenticated, False otherwise
-        """
         page: Optional[Page] = None
         try:
-            # Quick test: try to access a Google Maps page
             page = self._context.new_page()
             self._setup_consent_handler(page)
             page.goto(
@@ -226,15 +298,13 @@ class GoogleMapsSessionManager:
             except TimeoutError:
                 pass
 
-            authenticated = True
-
             if self.proxy_manager and self._current_proxy_info:
                 self.proxy_manager.record_success(self._current_proxy_info)
 
-            return authenticated
+            return True
 
-        except Exception as e:
-            self.logger.debug(f"Authentication check failed: {e}")
+        except Exception as exc:
+            self.logger.debug("Authentication check failed: %s", exc)
             if self.proxy_manager and self._current_proxy_info:
                 self.proxy_manager.record_failure(self._current_proxy_info)
             return False
@@ -246,59 +316,43 @@ class GoogleMapsSessionManager:
                     pass
 
     def _setup_authentication(self):
-        """Set up authentication by handling the consent flow."""
         self.logger.info("Setting up Google authentication...")
-
         page = self._context.new_page()
 
         try:
-            # Attach recaptcha listeners
             self._attach_recaptcha_listeners(page)
-
-            # Navigate to stable Maps root first to establish consent cookies
             page.goto("https://www.google.com/maps", wait_until="domcontentloaded")
-
-            # Set up automatic consent handler
             self._setup_consent_handler(page)
 
-            # Handle consent if needed
             if "consent.google.com" in page.url:
                 self.logger.info("Handling Google consent page...")
                 self._handle_consent_flow(page)
 
-            # Wait for Maps page to load
             self._wait_for_navigation(page)
-            
-            # Persist storage state immediately after successful navigation
             self._save_storage_state()
 
-            # Fail fast if recaptcha detected
             if self._recaptcha_detected:
                 raise Exception("Recaptcha detected during authentication")
 
             self.logger.info("Authentication setup complete")
 
-        except Exception as e:
-            # If we failed due to consent linger, try a limited number of retries
-            self.logger.error(f"Authentication setup failed: {e}")
+        except Exception as exc:
+            self.logger.error("Authentication setup failed: %s", exc)
             raise
         finally:
             page.close()
 
     def _setup_consent_handler(self, page: Page):
-        """Set up automatic locator handler for Google consent dialogs."""
         try:
-            # Set up handler for the consent page heading
             page.add_locator_handler(
                 page.get_by_role("heading", name="Before you continue to Google"),
-                lambda: self._click_accept_all(page)
+                lambda: self._click_accept_all(page),
             )
             self.logger.debug("Set up automatic consent handler")
-        except Exception as e:
-            self.logger.debug(f"Failed to set up consent handler: {e}")
+        except Exception as exc:
+            self.logger.debug("Failed to set up consent handler: %s", exc)
 
     def _handle_consent_flow(self, page: Page):
-        """Handle the Google consent flow."""
         from google_consent_handler import GoogleConsentHandler
 
         handler = GoogleConsentHandler()
@@ -307,37 +361,31 @@ class GoogleMapsSessionManager:
         if not success:
             raise Exception("Failed to automatically accept Google consent")
 
-        # Wait for redirect to complete and persist state
         self._wait_for_navigation(page)
         self._save_storage_state()
 
-        # Clear recaptcha flag post-consent
         if self._recaptcha_detected:
             self.logger.warning("Recaptcha was detected during consent handling")
 
     def _click_accept_all(self, page: Page):
-        """Click the Accept all button when consent dialog appears."""
         try:
             page.get_by_role("button", name="Accept all").click()
             self.logger.info("Automatically accepted Google consent")
-        except Exception as e:
-            self.logger.debug(f"Failed to click Accept all: {e}")
-            # Try alternative selectors
+        except Exception as exc:
+            self.logger.debug("Failed to click Accept all: %s", exc)
             try:
                 page.locator('[aria-label*="Accept"]').first.click()
                 self.logger.info("Accepted consent using aria-label")
-            except Exception as e2:
-                self.logger.warning(f"Could not automatically accept consent: {e2}")
+            except Exception as exc2:
+                self.logger.warning("Could not automatically accept consent: %s", exc2)
 
-        # After clicking, ensure we wait for navigation away from consent page
         try:
             self._wait_for_navigation(page)
             self._save_storage_state()
-        except Exception as e:
-            self.logger.debug(f"Post-accept wait/storage failed: {e}")
+        except Exception as exc:
+            self.logger.debug("Post-accept wait/storage failed: %s", exc)
 
     def _wait_for_navigation(self, page: Page, timeout: int = 20000):
-        """Wait for the page to navigate away from the consent page."""
         try:
             page.wait_for_load_state("domcontentloaded", timeout=timeout)
             page.wait_for_timeout(1000)
@@ -345,37 +393,33 @@ class GoogleMapsSessionManager:
             start_time = time.monotonic()
             while True:
                 current_url = page.url
-                self.logger.debug(f"Consent wait check URL: {current_url}")
+                self.logger.debug("Consent wait check URL: %s", current_url)
                 if "consent.google.com" not in current_url:
                     break
                 if (time.monotonic() - start_time) * 1000 > timeout:
                     raise TimeoutError("Still on consent page after waiting")
                 page.wait_for_timeout(500)
 
-            # Try to wait for network idle, but do not fail if it times out
             try:
                 page.wait_for_load_state("networkidle", timeout=timeout)
                 page.wait_for_timeout(1000)
             except TimeoutError:
-                # Proceed if we've left the consent domain
                 pass
 
-        except TimeoutError as e:
-            self.logger.error(f"Navigation timeout: {e}")
+        except TimeoutError as exc:
+            self.logger.error("Navigation timeout: %s", exc)
             raise
 
     def _save_storage_state(self):
-        """Persist storage state to disk for reuse."""
         try:
             if self._context:
                 state = self._context.storage_state()
                 self.storage_state_path.write_text(json.dumps(state))
-                self.logger.debug(f"Saved storage state to {self.storage_state_path}")
-        except Exception as e:
-            self.logger.warning(f"Failed to save storage state: {e}")
+                self.logger.debug("Saved storage state to %s", self.storage_state_path)
+        except Exception as exc:
+            self.logger.warning("Failed to save storage state: %s", exc)
 
     def _attach_recaptcha_listeners(self, page: Page):
-        """Attach simple listeners to detect recaptcha assets."""
         self._recaptcha_detected = False
 
         def on_response(response):
@@ -389,18 +433,15 @@ class GoogleMapsSessionManager:
             pass
 
     def cleanup(self):
-        """Clean up browser resources."""
-        # Save storage state if possible
         try:
             if self._context:
                 storage_state = self._context.storage_state()
                 storage_path = os.path.join(self.user_data_dir_path, "storage_state.json")
-                with open(storage_path, 'w') as f:
-                    json.dump(storage_state, f)
+                with open(storage_path, 'w') as fh:
+                    json.dump(storage_state, fh)
         except Exception:
             pass
 
-        # Close browser and playwright idempotently
         try:
             if self._browser:
                 self._browser.close()
@@ -425,30 +466,16 @@ class GoogleMapsSessionManager:
 
 
 def get_authenticated_page(headless: bool = False) -> Page:
-    """
-    Convenience function to get an authenticated Google Maps page.
-
-    Args:
-        headless: Whether to run in headless mode
-
-    Returns:
-        Authenticated Page object
-    """
     manager = GoogleMapsSessionManager(headless=headless)
     return manager.get_authenticated_page()
 
 
 if __name__ == "__main__":
-    # Quick test
     logging.basicConfig(level=logging.INFO)
-
     with GoogleMapsSessionManager() as manager:
         page = manager.get_authenticated_page()
         print(f"Authenticated page URL: {page.url}")
         print(f"Page title: {page.title()}")
-
-        # Test navigation
         page.goto("https://maps.app.goo.gl/FsGevWWrjvab4tZ9A", wait_until="domcontentloaded")
         print(f"Test URL loaded: {page.url}")
-
         page.close()
