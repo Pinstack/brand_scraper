@@ -10,9 +10,11 @@ Deliver a reliable pipeline that opens a Google Maps mall directory, clicks "Vie
 2. **Directory expansion**
    - Stabilise "View all" detection using resilient locators.
    - Add verification that the directory list is present (fallback messaging if missing).
+   - Keep a ranked selector list (e.g. `get_by_role("button", name="View all")` > `[aria-label="View all"]` > `[jslog^="103597"]`) with retries before failing.
 3. **Infinite scroll harvesting**
    - Implement loop that scrolls the list container and waits for network-idle, breaking when no new cards appear.
    - Capture telemetry for request throttling or captcha detection.
+   - Monitor `page.on("response")` for the `pb=` data feed; treat `204` or very small payloads (`<200 bytes`) as an end-of-scroll sentinel.
 4. **Brand parsing**
    - Target directory card selectors directly instead of generic role selectors.
    - Extract structured data (name, category, floor if present) for enrichment.
@@ -23,7 +25,7 @@ Deliver a reliable pipeline that opens a Google Maps mall directory, clicks "Vie
 ## Task Breakdown
 - [ ] **Session flow validation** – add integration test ensuring `get_authenticated_page` returns the mall URL when proxies are enabled.
 - [ ] **View all stabilisation** – refactor `_click_view_all_button` with explicit locator priorities and retries.
-- [ ] **Infinite scroll loop** – implement scroll helper that detects when no new results load.
+- [ ] **Infinite scroll loop** – implement scroll helper that detects when no new results load (using both DOM diffing and `pb=` network heuristics).
 - [ ] **Card parser** – introduce DOM parser targeting list item structure; unit test with fixture HTML.
 - [ ] **Filtering rules** – formalise exclusion logic and document in `docs/brand_extraction_plan.md`.
 - [ ] **Output formats** – extend `save_results` to emit optional CSV.
