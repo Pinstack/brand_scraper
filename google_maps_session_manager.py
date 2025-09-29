@@ -191,35 +191,38 @@ class GoogleMapsSessionManager:
         page = None
 
         if storage_fresh:
-            self.logger.info("Storage state still fresh; skipping auth probe")
+            self.logger.info("Storage state still fresh; assuming authenticated")
+            # Create a fresh page for the target URL
+            page = self._context.new_page()
+            self._setup_consent_handler(page)
+            page_reused = False
         else:
             page = self._is_authenticated()
-
-        if page:
-            self.logger.info("Using existing authenticated session")
-            page_reused = True
-        elif not storage_fresh:
-            self.logger.info("Setting up new authenticated session")
-            last_error = None
-            for attempt in range(self.max_auth_attempts):
-                try:
-                    page = self._setup_authentication()
-                    page_reused = True
-                    last_error = None
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    self.logger.warning(
-                        "Auth attempt %s/%s failed: %s",
-                        attempt + 1,
-                        self.max_auth_attempts,
-                        exc,
-                    )
+            if page:
+                self.logger.info("Using existing authenticated session")
+                page_reused = True
+            else:
+                self.logger.info("Setting up new authenticated session")
+                last_error = None
+                for attempt in range(self.max_auth_attempts):
                     try:
-                        self.cleanup()
-                    except Exception:
-                        pass
-                    self._start_browser()
+                        page = self._setup_authentication()
+                        page_reused = True
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        self.logger.warning(
+                            "Auth attempt %s/%s failed: %s",
+                            attempt + 1,
+                            self.max_auth_attempts,
+                            exc,
+                        )
+                        try:
+                            self.cleanup()
+                        except Exception:
+                            pass
+                        self._start_browser()
             if last_error:
                 raise last_error
 
@@ -244,20 +247,14 @@ class GoogleMapsSessionManager:
 
             if not self._urls_match(current_url, target_url):
                 self.logger.info("Navigating to target URL %s", target_url)
-                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                self.logger.info(f"[SESSION] Starting navigation from: {current_url}")
+                page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                self.logger.info(f"[SESSION] Navigation completed to: {page.url}")
+                # Brief wait for Google Maps SPA to initialize
+                page.wait_for_timeout(1000)
             if "consent.google.com" in page.url:
                 self.logger.info("Consent page detected after navigation")
                 self._handle_consent_flow(page)
-            else:
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=7000)
-                except TimeoutError:
-                    self.logger.debug("DOM content load wait timed out; continuing")
-                try:
-                    page.wait_for_load_state("load", timeout=5000)
-                except TimeoutError:
-                    self.logger.debug("Page load wait timed out; continuing")
-                page.wait_for_timeout(800)
         except Exception as exc:
             self.logger.error("Failed to load target URL %s: %s", target_url, exc)
             if reusable_page:

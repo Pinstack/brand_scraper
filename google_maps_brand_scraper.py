@@ -86,37 +86,55 @@ def activate_directory_tab(
 ) -> bool:
     logger = logger or logging.getLogger(__name__)
 
+    logger.info(f"[DIRECTORY_TAB] Starting activation with {len(selectors)} selectors")
+
     for attempt in range(1, max_attempts + 1):
+        logger.debug(f"[DIRECTORY_TAB] Attempt {attempt}/{max_attempts}")
         for selector in selectors:
+            logger.debug(f"[DIRECTORY_TAB] Trying selector: {selector}")
             try:
                 locator = page.locator(selector)
+                count = locator.count()
+                logger.debug(f"[DIRECTORY_TAB] Selector {selector} found {count} elements")
+
+                if count == 0:
+                    continue
+
                 candidate = getattr(locator, "first", locator)
                 if callable(candidate):
                     candidate = candidate()
 
                 if hasattr(candidate, "is_enabled"):
                     try:
-                        if not candidate.is_enabled():
+                        enabled = candidate.is_enabled()
+                        logger.debug(f"[DIRECTORY_TAB] Selector {selector} enabled: {enabled}")
+                        if not enabled:
                             continue
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[DIRECTORY_TAB] Selector {selector} enabled check failed: {e}")
                         continue
 
                 scroll_heading = getattr(candidate, "scroll_into_view_if_needed", None)
                 if callable(scroll_heading):
                     try:
                         scroll_heading(timeout=wait_between_attempts_ms)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[DIRECTORY_TAB] Selector {selector} scroll failed: {e}")
 
                 if not hasattr(candidate, "is_visible"):
+                    logger.debug(f"[DIRECTORY_TAB] Selector {selector} has no is_visible method")
                     continue
 
                 try:
-                    if not candidate.is_visible(timeout=wait_between_attempts_ms):
+                    visible = candidate.is_visible(timeout=wait_between_attempts_ms)
+                    logger.debug(f"[DIRECTORY_TAB] Selector {selector} visible: {visible}")
+                    if not visible:
                         continue
                 except PlaywrightTimeoutError:
+                    logger.debug(f"[DIRECTORY_TAB] Selector {selector} visibility timeout")
                     continue
 
+                logger.info(f"[DIRECTORY_TAB] Clicking selector: {selector}")
                 candidate.click()
                 page.wait_for_timeout(wait_between_attempts_ms)
                 logger.info("Activated directory tab via selector %s", selector)
@@ -572,21 +590,33 @@ def get_directory_cards(page, *, logger=None) -> List[Dict[str, Optional[str]]]:
 
     container_handle = None
     for selector in DIRECTORY_CONTAINER_SELECTORS:
+        logger.info("Trying directory container selector: %s", selector)
         try:
             candidate = page.locator(selector)
+            count = candidate.count()
+            logger.info("Selector %s found %d elements", selector, count)
+
+            if count == 0:
+                continue
+
             wait_for = getattr(candidate, "wait_for", None)
             if callable(wait_for):
                 try:
                     wait_for(state="attached", timeout=1500)
+                    logger.info("Selector %s is attached", selector)
                 except PlaywrightTimeoutError:
+                    logger.info("Selector %s attachment timeout", selector)
                     continue
+
             candidate.evaluate("el => el")
             container_handle = candidate
-            logger.debug("Using directory container selector: %s", selector)
+            logger.info("Using directory container selector: %s", selector)
             break
         except PlaywrightTimeoutError:
+            logger.info("Selector %s timeout", selector)
             continue
-        except Exception:
+        except Exception as e:
+            logger.info("Selector %s failed: %s", selector, e)
             continue
 
     if container_handle is None:
@@ -929,6 +959,7 @@ class GoogleMapsBrandScraper:
                     return
                 if frame != page.main_frame:
                     return
+                self.logger.info(f"[NAVIGATION] Frame navigated to: {frame.url}")
                 self._debug_dump(page, label=f"navigation-{frame.url}")
 
             nav_handler = _on_navigation
@@ -946,7 +977,6 @@ class GoogleMapsBrandScraper:
             if should_navigate:
                 page.goto(url, wait_until="domcontentloaded")
                 self._debug_dump(page, label="post-goto")
-                self._ensure_directory_view(page)
 
             # Handle scenarios where navigation sends us back to consent page
             if "consent.google.com" in page.url:
@@ -990,47 +1020,59 @@ class GoogleMapsBrandScraper:
                     pass
 
     def _ensure_directory_view(self, page):
+        """Navigate directly to directory view by adding !10e3!16s parameters."""
         try:
             current_url = getattr(page, "url", "")
         except Exception:
             current_url = ""
 
-        if "!10e3" in current_url:
-            return
+        # Check if already in directory view
+        if "!10e3" in current_url and "!16s" in current_url:
+            self.logger.debug("Already in directory view with !10e3!16s")
+            return False
 
-        if "!10e" in current_url:
-            new_url = current_url.split("!10e", 1)[0] + "!10e3"
+        # Add both !10e3 and !16s parameters
+        if "?" in current_url:
+            # URL has query parameters, add the view parameters before them
+            base_url, query = current_url.split("?", 1)
+            new_url = f"{base_url}!10e3!16s?{query}"
         else:
-            new_url = f"{current_url}!10e3" if current_url else current_url
+            # No query parameters, just append
+            new_url = f"{current_url}!10e3!16s"
 
-        if not new_url:
-            return
         if new_url == current_url:
-            return
+            return False
 
-        self.logger.info("Switching to directory view via !10e3 URL variant")
+        self.logger.info(f"Navigating directly to directory view: {new_url}")
         try:
-            page.goto(new_url, wait_until="domcontentloaded")
-            self._debug_dump(page, label="state-directory-view-navigate")
+            page.goto(new_url, wait_until="domcontentloaded", timeout=15000)
+            self.logger.info(f"Directory view navigation completed: {page.url}")
+            # Wait for directory content to load
+            page.wait_for_timeout(5000)
+            self._debug_dump(page, label="state-directory-direct")
+            return True
         except Exception as exc:
-            self.logger.warning("Failed to navigate to directory view URL: %s", exc)
+            self.logger.warning(f"Failed to navigate to directory view: {exc}")
+            return False
 
     def _extract_brands_from_directory(self, page) -> List[str]:
         """Extract brand names from the Google Maps directory."""
 
-        # Ensure the directory tab is active before attempting to expand
-        if not activate_directory_tab(page, logger=self.logger):
-            self.logger.warning("Directory tab not found; falling back to default content")
-        else:
-            self._debug_dump(page, label="state-directory-tab-active")
+        # Debug: Check current URL and page state
+        current_url = page.url
+        self.logger.info(f"[EXTRACTION] Starting extraction on URL: {current_url}")
 
-        # Click "View all" to expand the directory when present
+        # Try to expand directory by clicking "View all" buttons
         view_all_clicked = _click_view_all_button(page, logger=self.logger)
         if view_all_clicked:
+            self.logger.info("[EXTRACTION] View all button clicked successfully")
             self._debug_dump(page, label="state-view-all-clicked")
+            # Wait for directory to expand
+            page.wait_for_timeout(3000)
         else:
-            self.logger.info("View all button not present; continuing without manual expansion")
-            self._debug_dump(page, label="state-view-all-missing")
+            self.logger.warning("[EXTRACTION] No View all button found")
+
+        self._debug_dump(page, label="state-directory-ready")
 
         collected_cards: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Optional[str]]] = {}
 
