@@ -233,7 +233,13 @@ class GoogleMapsSessionManager:
             pass
 
         try:
-            if page.url != target_url:
+            current_url = ""
+            try:
+                current_url = page.url
+            except Exception:
+                current_url = ""
+
+            if not self._urls_match(current_url, target_url):
                 self.logger.info("Navigating to target URL %s", target_url)
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             if "consent.google.com" in page.url:
@@ -241,10 +247,14 @@ class GoogleMapsSessionManager:
                 self._handle_consent_flow(page)
             else:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                    page.wait_for_timeout(1000)
+                    page.wait_for_load_state("domcontentloaded", timeout=7000)
                 except TimeoutError:
-                    pass
+                    self.logger.debug("DOM content load wait timed out; continuing")
+                try:
+                    page.wait_for_load_state("load", timeout=5000)
+                except TimeoutError:
+                    self.logger.debug("Page load wait timed out; continuing")
+                page.wait_for_timeout(800)
         except Exception as exc:
             self.logger.error("Failed to load target URL %s: %s", target_url, exc)
             if reusable_page:
@@ -352,6 +362,19 @@ class GoogleMapsSessionManager:
             return age < max_age_seconds
         except Exception:
             return False
+
+    @staticmethod
+    def _urls_match(current: str, target: str) -> bool:
+        if not current or not target:
+            return False
+
+        def _normalize(url: str) -> str:
+            base = url.split("#", 1)[0]
+            if base.endswith("/"):
+                base = base.rstrip("/")
+            return base
+
+        return _normalize(current) == _normalize(target)
 
     def _is_authenticated(self) -> Optional[Page]:
         page: Optional[Page] = None

@@ -17,6 +17,7 @@ Usage:
 """
 
 import logging
+import os
 import re
 import time
 import json
@@ -162,11 +163,19 @@ class PbDirectoryCollector:
         if status not in (200, 204):
             return
 
+        text: Optional[str] = None
         try:
-            text = response.text()
-        except Exception as exc:
-            self.logger.debug("Failed to read pb payload: %s", exc)
-            return
+            body = response.body()
+            if isinstance(body, bytes):
+                text = body.decode("utf-8", errors="ignore")
+            else:
+                text = body or ""
+        except Exception:
+            try:
+                text = response.text()
+            except Exception as exc:
+                self.logger.debug("Failed to read pb payload: %s", exc)
+                return
 
         if not text:
             return
@@ -663,21 +672,16 @@ def scroll_directory_until_complete(
 
     pb_triggered = False
     responses = 0
-
-    if collect_pb_bodies:
-        existing = set()
-        try:
-            existing = set(page.context._har_traces.keys())  # type: ignore[attr-defined]
-        except Exception:
-            collect_pb_bodies = False
+    pb_sentinel_streak = 0
+    sentinel_required = 3
 
     def _on_response(response):
-        nonlocal pb_triggered, responses
+        nonlocal pb_triggered, responses, pb_sentinel_streak
         responses += 1
         url = getattr(response, "url", "")
         status = getattr(response, "status", None)
         if "pb=" in url and status in (204, 200):
-            content_length = None
+            sentinel_hit = status == 204
             try:
                 header_value = response.header_value("Content-Length")
             except AttributeError:
@@ -687,13 +691,30 @@ def scroll_directory_until_complete(
                     content_length = int(header_value)
                 except ValueError:
                     content_length = None
-            if status == 204 or (content_length is not None and content_length < pb_payload_threshold):
+            else:
+                content_length = None
+
+            if not sentinel_hit and content_length is not None and content_length < pb_payload_threshold:
+                sentinel_hit = True
+
+            stored_before = pb_collector.total_stored if pb_collector is not None else 0
+            if pb_collector is not None:
+                try:
+                    pb_collector.on_response(response)
+                except Exception as exc:
+                    logger.debug("pb collector failed: %s", exc)
+                else:
+                    if pb_collector.total_stored > stored_before:
+                        sentinel_hit = False
+
+            if sentinel_hit:
+                pb_sentinel_streak += 1
+            else:
+                pb_sentinel_streak = 0
+                pb_triggered = False
+
+            if pb_sentinel_streak >= sentinel_required:
                 pb_triggered = True
-        if pb_collector is not None:
-            try:
-                pb_collector.on_response(response)
-            except Exception as exc:
-                logger.debug("pb collector failed: %s", exc)
 
     page.on("response", _on_response)
 
@@ -728,6 +749,7 @@ def scroll_directory_until_complete(
             else:
                 empty_scrolls = 0
                 last_child_count = current_child_count
+                pb_sentinel_streak = 0
 
             if current_height <= last_scroll_height:
                 idle_scrolls += 1
@@ -750,14 +772,22 @@ def scroll_directory_until_complete(
                 idle_scrolls,
             )
 
-            if pb_triggered or empty_scrolls >= max_empty_scrolls or idle_scrolls >= idle_scroll_threshold:
+            sentinel_ready = pb_triggered
+            stagnated = empty_scrolls >= max_empty_scrolls and idle_scrolls >= idle_scroll_threshold
+
+            if sentinel_ready and stagnated:
+                break
+
+            if stagnated and total_scrolls >= sentinel_required * 2:
                 break
 
         telemetry.scrolls_performed = total_scrolls
         telemetry.final_card_count = last_child_count
         telemetry.pb_sentinel_triggered = pb_triggered
         telemetry.responses_observed = responses
-        telemetry.cards_collected = None
+        telemetry.cards_collected = (
+            pb_collector.total_stored if pb_collector is not None else None
+        )
         return telemetry
     finally:
         if callable(on_iteration):
@@ -852,6 +882,8 @@ class GoogleMapsBrandScraper:
         self.use_proxies = use_proxies
         self.proxy_manager = proxy_manager
         self._debug_event_counter = 0
+        debug_env = os.getenv("GMAPS_DEBUG_SNAPSHOTS") or os.getenv("GMAPS_DEBUG_DUMPS")
+        self.debug_snapshots_enabled = self._parse_debug_flag(debug_env)
 
         if not hasattr(self, "_debug_dump"):
             self._debug_dump = lambda *args, **kwargs: None
@@ -919,37 +951,37 @@ class GoogleMapsBrandScraper:
             self._debug_dump(page, label="post-auth")
 
             # Avoid redundant navigation when proxy flow already loads target page
-            should_navigate = (
-                not self.use_proxies
-                or not getattr(page, "url", None)
-                or page.url in {"about:blank", ""}
-                or "consent.google.com" in page.url
-            )
+            current_url = getattr(page, "url", "") or ""
+            should_navigate = self._should_navigate(current_url, url)
 
             if should_navigate:
                 page.goto(url, wait_until="domcontentloaded")
                 self._debug_dump(page, label="post-goto")
-                self._ensure_directory_view(page)
+
+            self._ensure_directory_view(page)
 
             # Handle scenarios where navigation sends us back to consent page
             if "consent.google.com" in page.url:
                 self.logger.info("Redirected to consent page after navigation; re-running consent handler")
                 session_manager._handle_consent_flow(page)
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(2000)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except PlaywrightTimeoutError:
+                    self.logger.debug("Consent retry did not reach DOM loaded within 5s; proceeding")
+                page.wait_for_timeout(1500)
                 if "consent.google.com" in page.url:
                     raise RuntimeError("Unable to pass consent page after retry")
             else:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=self.timeout)
+                    page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout, 8000))
                 except PlaywrightTimeoutError:
-                    self.logger.warning("Network idle state not reached within %sms; continuing", self.timeout)
+                    self.logger.debug("DOM content load wait timed out; continuing with visible content")
                 finally:
                     try:
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        page.wait_for_load_state("load", timeout=5000)
                     except PlaywrightTimeoutError:
-                        self.logger.debug("DOM content load wait also timed out; proceeding regardless")
-                page.wait_for_timeout(2000)
+                        self.logger.debug("Page load wait timed out; proceeding regardless")
+                page.wait_for_timeout(1200)
 
             # Extract brands from the directory
             brands = self._extract_brands_from_directory(page)
@@ -985,6 +1017,8 @@ class GoogleMapsBrandScraper:
 
         if not new_url:
             return
+        if new_url == current_url:
+            return
 
         self.logger.info("Switching to directory view via !10e3 URL variant")
         try:
@@ -1002,13 +1036,13 @@ class GoogleMapsBrandScraper:
         else:
             self._debug_dump(page, label="state-directory-tab-active")
 
-        # Click "View all" to expand the directory
-        if not _click_view_all_button(page, logger=self.logger):
-            self.logger.warning("Could not click View all button - may not have directory")
+        # Click "View all" to expand the directory when present
+        view_all_clicked = _click_view_all_button(page, logger=self.logger)
+        if view_all_clicked:
+            self._debug_dump(page, label="state-view-all-clicked")
+        else:
+            self.logger.info("View all button not present; continuing without manual expansion")
             self._debug_dump(page, label="state-view-all-missing")
-            return []
-
-        self._debug_dump(page, label="state-view-all-clicked")
 
         collected_cards: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Optional[str]]] = {}
 
@@ -1048,12 +1082,6 @@ class GoogleMapsBrandScraper:
 
         brands = sorted({card[0] for card in collected_cards.keys() if card[0] and card[0].lower() not in CTA_EXCLUSION_NAMES})
         pb_cards = filter_cards(pb_collector.extract_cards())
-        if not pb_cards:
-            try:
-                har_cards = _load_pb_payloads_from_har(page.context, logger=self.logger)
-                pb_cards = filter_cards(har_cards)
-            except Exception as exc:
-                self.logger.debug("HAR parsing failed: %s", exc)
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
                 "PB collector returned %s cards (seen=%s stored=%s)",
@@ -1110,6 +1138,9 @@ class GoogleMapsBrandScraper:
         return filename
 
     def _debug_dump(self, page, label: str):
+        if not self.debug_snapshots_enabled:
+            return
+
         safe_label = self._sanitize_label(label)
         self._debug_event_counter += 1
         prefix = f"{self._debug_event_counter:03d}_{safe_label}"
@@ -1144,6 +1175,37 @@ class GoogleMapsBrandScraper:
         if len(safe) > 80:
             safe = safe[:80]
         return safe or "event"
+
+    @staticmethod
+    def _parse_debug_flag(value: Optional[str]) -> bool:
+        if value is None:
+            return False
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        return normalized in {"1", "true", "yes", "on", "debug"}
+
+    @staticmethod
+    def _urls_equivalent(current: str, target: str) -> bool:
+        if not current or not target:
+            return False
+
+        def _normalize(url: str) -> str:
+            base = url.split("#", 1)[0]
+            if base.endswith("/"):
+                base = base.rstrip("/")
+            return base
+
+        return _normalize(current) == _normalize(target)
+
+    def _should_navigate(self, current_url: str, target_url: str) -> bool:
+        if not target_url:
+            return False
+        if not current_url or current_url in {"about:blank", ""}:
+            return True
+        if "consent.google.com" in current_url:
+            return True
+        return not self._urls_equivalent(current_url, target_url)
 
 
 def main():
