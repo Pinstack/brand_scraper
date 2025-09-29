@@ -672,11 +672,8 @@ def scroll_directory_until_complete(
 
     pb_triggered = False
     responses = 0
-    pb_sentinel_streak = 0
-    sentinel_required = 3
-
     def _on_response(response):
-        nonlocal pb_triggered, responses, pb_sentinel_streak
+        nonlocal pb_triggered, responses
         responses += 1
         url = getattr(response, "url", "")
         status = getattr(response, "status", None)
@@ -684,19 +681,20 @@ def scroll_directory_until_complete(
             sentinel_hit = status == 204
             try:
                 header_value = response.header_value("Content-Length")
-            except AttributeError:
-                header_value = None
-            if header_value is not None:
-                try:
-                    content_length = int(header_value)
-                except ValueError:
+                if header_value is not None:
+                    try:
+                        content_length = int(header_value)
+                    except ValueError:
+                        content_length = None
+                else:
                     content_length = None
-            else:
+            except AttributeError:
                 content_length = None
 
             if not sentinel_hit and content_length is not None and content_length < pb_payload_threshold:
                 sentinel_hit = True
 
+            # Don't override sentinel detection if pb_collector stored data
             stored_before = pb_collector.total_stored if pb_collector is not None else 0
             if pb_collector is not None:
                 try:
@@ -708,12 +706,6 @@ def scroll_directory_until_complete(
                         sentinel_hit = False
 
             if sentinel_hit:
-                pb_sentinel_streak += 1
-            else:
-                pb_sentinel_streak = 0
-                pb_triggered = False
-
-            if pb_sentinel_streak >= sentinel_required:
                 pb_triggered = True
 
     page.on("response", _on_response)
@@ -749,7 +741,6 @@ def scroll_directory_until_complete(
             else:
                 empty_scrolls = 0
                 last_child_count = current_child_count
-                pb_sentinel_streak = 0
 
             if current_height <= last_scroll_height:
                 idle_scrolls += 1
@@ -773,12 +764,10 @@ def scroll_directory_until_complete(
             )
 
             sentinel_ready = pb_triggered
-            stagnated = empty_scrolls >= max_empty_scrolls and idle_scrolls >= idle_scroll_threshold
+            stagnated = empty_scrolls >= max_empty_scrolls or idle_scrolls >= idle_scroll_threshold
 
-            if sentinel_ready and stagnated:
-                break
-
-            if stagnated and total_scrolls >= sentinel_required * 2:
+            # Stop when sentinel detected OR when clearly at end (stagnated)
+            if sentinel_ready or stagnated:
                 break
 
         telemetry.scrolls_performed = total_scrolls
@@ -957,8 +946,7 @@ class GoogleMapsBrandScraper:
             if should_navigate:
                 page.goto(url, wait_until="domcontentloaded")
                 self._debug_dump(page, label="post-goto")
-
-            self._ensure_directory_view(page)
+                self._ensure_directory_view(page)
 
             # Handle scenarios where navigation sends us back to consent page
             if "consent.google.com" in page.url:
