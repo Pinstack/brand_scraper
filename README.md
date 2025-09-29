@@ -40,14 +40,14 @@ This keeps the project DRY by centralising session logic in a single module.
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
    ```
 
-3. **Install dependencies**:
+3. **Install dependencies** (using uv for speed and reproducibility):
    ```bash
-   pip install -r requirements.txt
+   uv pip install -r requirements.txt
    ```
 
 4. **Install Playwright browsers**:
    ```bash
-   playwright install chromium
+   uv run playwright install chromium
    ```
 
 ## Usage
@@ -150,6 +150,7 @@ The module uses Python's logging system. Configure logging before using:
 
 ```python
 import logging
+import uvicorn
 logging.basicConfig(level=logging.INFO)  # or logging.DEBUG for verbose output
 ```
 

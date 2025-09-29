@@ -14,7 +14,8 @@
 - `google_maps_brand_scraper.py` exposes CLI arguments and can be imported as a module.
 
 ## Data & Misc
-- Temporary JSONs (e.g., `*_retry.json`) capture run artefacts; consider moving into `data/` if persistence is needed.
+- `data/` stores screenshots and historical JSON outputs from manual runs.
+- `data/README.md` documents the meaning of each artefact.
 
 ## Todo
-- Migrate remaining legacy standalone scraper `google_maps_scraper.py` into the modular flow or archive under `legacy/` if required.
+- Consider turning legacy scripts into regression tests.
