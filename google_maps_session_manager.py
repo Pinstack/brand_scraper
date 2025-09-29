@@ -187,41 +187,44 @@ class GoogleMapsSessionManager:
         page: Optional[Page]
         page_reused = False
 
-        if self._storage_state_is_fresh():
-            self.logger.info("Using fresh storage state; skipping auth check")
-            page = self._context.new_page()
+        storage_fresh = self._storage_state_is_fresh()
+        page = None
+
+        if storage_fresh:
+            self.logger.info("Storage state still fresh; skipping auth probe")
         else:
             page = self._is_authenticated()
 
-            if page:
-                self.logger.info("Using existing authenticated session")
-                page_reused = True
-            else:
-                self.logger.info("Setting up new authenticated session")
-                last_error = None
-                for attempt in range(self.max_auth_attempts):
+        if page:
+            self.logger.info("Using existing authenticated session")
+            page_reused = True
+        elif not storage_fresh:
+            self.logger.info("Setting up new authenticated session")
+            last_error = None
+            for attempt in range(self.max_auth_attempts):
+                try:
+                    page = self._setup_authentication()
+                    page_reused = True
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    self.logger.warning(
+                        "Auth attempt %s/%s failed: %s",
+                        attempt + 1,
+                        self.max_auth_attempts,
+                        exc,
+                    )
                     try:
-                        page = self._setup_authentication()
-                        page_reused = True
-                        last_error = None
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                        self.logger.warning(
-                            "Auth attempt %s/%s failed: %s",
-                            attempt + 1,
-                            self.max_auth_attempts,
-                            exc,
-                        )
-                        try:
-                            self.cleanup()
-                        except Exception:
-                            pass
-                        self._start_browser()
-                if last_error:
-                    raise last_error
-                if page is None or page.is_closed():
-                    page = self._context.new_page()
+                        self.cleanup()
+                    except Exception:
+                        pass
+                    self._start_browser()
+            if last_error:
+                raise last_error
+
+        if page is None or page.is_closed():
+            page = self._context.new_page()
 
         if page is None:
             page = self._context.new_page()
@@ -384,7 +387,7 @@ class GoogleMapsSessionManager:
             page.goto(
                 "https://www.google.com/maps",
                 wait_until="domcontentloaded",
-                timeout=25000,
+                timeout=15000,
             )
 
             if "consent.google.com" in page.url:
@@ -392,9 +395,9 @@ class GoogleMapsSessionManager:
                 return False
 
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("load", timeout=3000)
             except TimeoutError:
-                pass
+                self.logger.debug("Auth probe load wait timed out; continuing")
 
             if self.proxy_manager and self._current_proxy_info:
                 self.proxy_manager.record_success(self._current_proxy_info)
