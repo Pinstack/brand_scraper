@@ -233,16 +233,22 @@ class GoogleMapsSessionManager:
             pass
 
         try:
-            if page.url != target_url:
+            current_url = getattr(page, "url", "")
+            if not current_url or current_url in {"about:blank", ""} or current_url == "data:,":
+                should_navigate = True
+            else:
+                should_navigate = current_url != target_url
+
+            if should_navigate:
                 self.logger.info("Navigating to target URL %s", target_url)
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+
             if "consent.google.com" in page.url:
                 self.logger.info("Consent page detected after navigation")
                 self._handle_consent_flow(page)
             else:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                    page.wait_for_timeout(1000)
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
                 except TimeoutError:
                     pass
         except Exception as exc:
@@ -255,6 +261,12 @@ class GoogleMapsSessionManager:
             raise
 
         return page
+
+    @property
+    def active_har_path(self) -> Optional[Path]:
+        """Return the HAR file currently being recorded, if any."""
+
+        return self._active_har_path
 
     def _handle_consent_simple(self, page: Page):
         """Handle Google consent page using a lightweight strategy."""

@@ -21,7 +21,9 @@ import re
 import time
 import json
 import base64
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qsl, urlsplit
 
 from playwright.sync_api import sync_playwright, Browser, TimeoutError as PlaywrightTimeoutError
 from google_maps_session_manager import GoogleMapsSessionManager
@@ -196,48 +198,6 @@ class PbDirectoryCollector:
         return cards
 
 
-def _load_pb_payloads_from_har(context, *, logger=None) -> List[Dict[str, Optional[str]]]:
-    logger = logger or logging.getLogger(__name__)
-    payloads: List[str] = []
-
-    try:
-        har_traces = getattr(context, "_har_traces", None)
-        if not har_traces:
-            return []
-
-        for har_entry in har_traces.values():
-            try:
-                for record in har_entry.get("entries", []):
-                    request = record.get("request", {})
-                    response = record.get("response", {})
-                    url = request.get("url")
-                    if not url or "pb=" not in url:
-                        continue
-                    status = response.get("status")
-                    if status not in (200, 204):
-                        continue
-                    content = response.get("content", {})
-                    text = content.get("text")
-                    if not text:
-                        continue
-                    if content.get("encoding") == "base64":
-                        try:
-                            decoded = base64.b64decode(text).decode("utf-8", errors="ignore")
-                        except Exception:
-                            continue
-                        payloads.append(decoded)
-                    else:
-                        payloads.append(text)
-            except Exception as exc:
-                logger.debug("Failed to parse HAR entry: %s", exc)
-    except Exception as exc:
-        logger.debug("Error while accessing HAR traces: %s", exc)
-
-    collector = PbDirectoryCollector(logger=logger)
-    for payload in payloads:
-        collector._payloads.append(payload)
-    return collector.extract_cards()
-
     def _extract_cards_from_payload(self, payload) -> List[Dict[str, Optional[str]]]:
         results: List[Dict[str, Optional[str]]] = []
 
@@ -316,6 +276,67 @@ def _load_pb_payloads_from_har(context, *, logger=None) -> List[Dict[str, Option
             elif isinstance(current, list):
                 queue.extend(current)
         return None
+
+
+def _load_pb_payloads_from_har(
+    context,
+    *,
+    har_path: Optional[Path] = None,
+    logger=None,
+) -> List[Dict[str, Optional[str]]]:
+    logger = logger or logging.getLogger(__name__)
+    payloads: List[str] = []
+
+    if har_path is None:
+        har_path = getattr(context, "_recording_har_path", None)
+        if har_path is None:
+            har_path = getattr(context, "record_har_path", None)
+
+    har_file: Optional[Path]
+    if isinstance(har_path, Path):
+        har_file = har_path
+    elif isinstance(har_path, str):
+        har_file = Path(har_path)
+    else:
+        har_file = None
+
+    if har_file and har_file.exists():
+        try:
+            with har_file.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            logger.debug("Failed to load HAR file %s: %s", har_file, exc)
+        else:
+            for record in data.get("log", {}).get("entries", []):
+                request = record.get("request", {})
+                response = record.get("response", {})
+                url = request.get("url")
+                if not url or "pb=" not in url:
+                    continue
+                status = response.get("status")
+                if status not in (200, 204):
+                    continue
+                content = response.get("content", {})
+                text = content.get("text")
+                if not text:
+                    continue
+                if content.get("encoding") == "base64":
+                    try:
+                        decoded = base64.b64decode(text).decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    payloads.append(decoded)
+                else:
+                    payloads.append(text)
+
+    if not payloads:
+        logger.debug("No pb payloads found in HAR file")
+        return []
+
+    collector = PbDirectoryCollector(logger=logger)
+    for payload in payloads:
+        collector._payloads.append(payload)
+    return collector.extract_cards()
 
 
 def _click_view_all_button(
@@ -613,6 +634,7 @@ def scroll_directory_until_complete(
     wait_between_scrolls_ms: int = 300,
     pb_payload_threshold: int = 200,
     idle_scroll_threshold: int = 3,
+    pb_sentinel_required: int = 3,
     on_iteration=None,
     pb_collector: Optional[PbDirectoryCollector] = None,
     collect_pb_bodies: bool = True,
@@ -664,15 +686,13 @@ def scroll_directory_until_complete(
     pb_triggered = False
     responses = 0
 
-    if collect_pb_bodies:
-        existing = set()
-        try:
-            existing = set(page.context._har_traces.keys())  # type: ignore[attr-defined]
-        except Exception:
-            collect_pb_bodies = False
+    if not collect_pb_bodies:
+        pb_collector = None
+
+    pb_sentinel_count = 0
 
     def _on_response(response):
-        nonlocal pb_triggered, responses
+        nonlocal pb_triggered, responses, pb_sentinel_count
         responses += 1
         url = getattr(response, "url", "")
         status = getattr(response, "status", None)
@@ -688,7 +708,10 @@ def scroll_directory_until_complete(
                 except ValueError:
                     content_length = None
             if status == 204 or (content_length is not None and content_length < pb_payload_threshold):
-                pb_triggered = True
+                pb_sentinel_count += 1
+            else:
+                pb_sentinel_count = 0
+            pb_triggered = pb_sentinel_count >= max(1, pb_sentinel_required)
         if pb_collector is not None:
             try:
                 pb_collector.on_response(response)
@@ -750,7 +773,10 @@ def scroll_directory_until_complete(
                 idle_scrolls,
             )
 
-            if pb_triggered or empty_scrolls >= max_empty_scrolls or idle_scrolls >= idle_scroll_threshold:
+            if pb_triggered and idle_scrolls >= idle_scroll_threshold:
+                break
+
+            if max_empty_scrolls and empty_scrolls >= max_empty_scrolls and idle_scrolls >= idle_scroll_threshold:
                 break
 
         telemetry.scrolls_performed = total_scrolls
@@ -838,7 +864,14 @@ class GoogleMapsBrandScraper:
     brand extraction logic.
     """
 
-    def __init__(self, headless: bool = False, timeout: int = 30000, use_proxies: bool = False, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(
+        self,
+        headless: bool = False,
+        timeout: int = 30000,
+        use_proxies: bool = False,
+        proxy_manager: Optional[ProxyManager] = None,
+        enable_debug_dumps: bool = False,
+    ):
         """
         Initialize the brand scraper.
 
@@ -852,6 +885,7 @@ class GoogleMapsBrandScraper:
         self.use_proxies = use_proxies
         self.proxy_manager = proxy_manager
         self._debug_event_counter = 0
+        self.enable_debug_dumps = enable_debug_dumps
 
         if not hasattr(self, "_debug_dump"):
             self._debug_dump = lambda *args, **kwargs: None
@@ -900,6 +934,7 @@ class GoogleMapsBrandScraper:
             self._debug_event_counter = 0
             # Get authenticated page
             page = session_manager.get_authenticated_page(target_url=url)
+            active_har_path = session_manager.active_har_path
 
             def _on_navigation(frame):
                 if frame is None or frame.page is None:
@@ -919,17 +954,18 @@ class GoogleMapsBrandScraper:
             self._debug_dump(page, label="post-auth")
 
             # Avoid redundant navigation when proxy flow already loads target page
-            should_navigate = (
-                not self.use_proxies
-                or not getattr(page, "url", None)
-                or page.url in {"about:blank", ""}
-                or "consent.google.com" in page.url
-            )
+            current_url = getattr(page, "url", "") or ""
+            should_navigate = not self._urls_equivalent(current_url, url)
+            if "consent.google.com" in current_url:
+                should_navigate = True
 
             if should_navigate:
                 page.goto(url, wait_until="domcontentloaded")
                 self._debug_dump(page, label="post-goto")
-                self._ensure_directory_view(page)
+            else:
+                self.logger.info("Reusing existing page already at target location")
+
+            self._ensure_directory_view(page)
 
             # Handle scenarios where navigation sends us back to consent page
             if "consent.google.com" in page.url:
@@ -941,18 +977,13 @@ class GoogleMapsBrandScraper:
                     raise RuntimeError("Unable to pass consent page after retry")
             else:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=self.timeout)
+                    page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout, 10000))
                 except PlaywrightTimeoutError:
-                    self.logger.warning("Network idle state not reached within %sms; continuing", self.timeout)
-                finally:
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except PlaywrightTimeoutError:
-                        self.logger.debug("DOM content load wait also timed out; proceeding regardless")
-                page.wait_for_timeout(2000)
+                    self.logger.debug("DOM content load wait timed out; continuing")
+                page.wait_for_timeout(750)
 
             # Extract brands from the directory
-            brands = self._extract_brands_from_directory(page)
+            brands = self._extract_brands_from_directory(page, har_path=active_har_path)
 
             self.logger.info("Successfully scraped %d brands", len(brands))
             return brands
@@ -993,7 +1024,7 @@ class GoogleMapsBrandScraper:
         except Exception as exc:
             self.logger.warning("Failed to navigate to directory view URL: %s", exc)
 
-    def _extract_brands_from_directory(self, page) -> List[str]:
+    def _extract_brands_from_directory(self, page, *, har_path: Optional[Path] = None) -> List[str]:
         """Extract brand names from the Google Maps directory."""
 
         # Ensure the directory tab is active before attempting to expand
@@ -1002,13 +1033,13 @@ class GoogleMapsBrandScraper:
         else:
             self._debug_dump(page, label="state-directory-tab-active")
 
-        # Click "View all" to expand the directory
-        if not _click_view_all_button(page, logger=self.logger):
-            self.logger.warning("Could not click View all button - may not have directory")
+        # Click "View all" to expand the directory when available
+        view_all_clicked = _click_view_all_button(page, logger=self.logger)
+        if not view_all_clicked:
+            self.logger.info("View all button not available; proceeding with current directory content")
             self._debug_dump(page, label="state-view-all-missing")
-            return []
-
-        self._debug_dump(page, label="state-view-all-clicked")
+        else:
+            self._debug_dump(page, label="state-view-all-clicked")
 
         collected_cards: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Optional[str]]] = {}
 
@@ -1050,7 +1081,7 @@ class GoogleMapsBrandScraper:
         pb_cards = filter_cards(pb_collector.extract_cards())
         if not pb_cards:
             try:
-                har_cards = _load_pb_payloads_from_har(page.context, logger=self.logger)
+                har_cards = _load_pb_payloads_from_har(page.context, har_path=har_path, logger=self.logger)
                 pb_cards = filter_cards(har_cards)
             except Exception as exc:
                 self.logger.debug("HAR parsing failed: %s", exc)
@@ -1110,6 +1141,9 @@ class GoogleMapsBrandScraper:
         return filename
 
     def _debug_dump(self, page, label: str):
+        if not self.enable_debug_dumps:
+            return
+
         safe_label = self._sanitize_label(label)
         self._debug_event_counter += 1
         prefix = f"{self._debug_event_counter:03d}_{safe_label}"
@@ -1144,6 +1178,36 @@ class GoogleMapsBrandScraper:
         if len(safe) > 80:
             safe = safe[:80]
         return safe or "event"
+
+    @staticmethod
+    def _urls_equivalent(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+
+        try:
+            left_parts = urlsplit(left)
+            right_parts = urlsplit(right)
+        except Exception:
+            return left == right
+
+        if (left_parts.scheme, left_parts.netloc, left_parts.path) != (
+            right_parts.scheme,
+            right_parts.netloc,
+            right_parts.path,
+        ):
+            return False
+
+        excluded = {"authuser", "hl", "entry", "g_st", "g_ep"}
+
+        def _normalise_query(parts):
+            params = [
+                (key, value)
+                for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                if key not in excluded
+            ]
+            return tuple(sorted(params))
+
+        return _normalise_query(left_parts) == _normalise_query(right_parts)
 
 
 def main():
