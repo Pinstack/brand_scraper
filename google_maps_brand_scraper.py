@@ -1030,40 +1030,78 @@ class GoogleMapsBrandScraper:
         return url
 
     def _ensure_directory_view(self, page):
-        """Navigate directly to directory view by adding !10e3!16s parameters."""
+        """Experiment with different URL parameter combinations for directory view."""
         try:
             current_url = getattr(page, "url", "")
         except Exception:
             current_url = ""
 
-        # Check if already in directory view
-        if "!10e3" in current_url and "!16s" in current_url:
-            self.logger.debug("Already in directory view with !10e3!16s")
+        # Define parameter combinations to test (in order of preference)
+        param_combinations = [
+            "!10e3!16s",  # Current working combination
+            "!16s!10e3",  # Reversed order
+            "!10e3",      # Just the first parameter
+            "!16s",       # Just the second parameter
+            "!10e3!16e",  # Variations
+            "!10e3!16i",
+            "!16s!10e3!16e",
+        ]
+
+        # Check if already has any of our target parameters
+        has_directory_params = any(param in current_url for param in ["!10e3", "!16s"])
+        if has_directory_params:
+            self.logger.debug(f"Already has directory parameters in URL: {current_url}")
             return False
 
-        # Add both !10e3 and !16s parameters
-        if "?" in current_url:
-            # URL has query parameters, add the view parameters before them
-            base_url, query = current_url.split("?", 1)
-            new_url = f"{base_url}!10e3!16s?{query}"
-        else:
-            # No query parameters, just append
-            new_url = f"{current_url}!10e3!16s"
+        # Try each parameter combination
+        for params in param_combinations:
+            try:
+                # Construct new URL
+                if "?" in current_url:
+                    base_url, query = current_url.split("?", 1)
+                    new_url = f"{base_url}{params}?{query}"
+                else:
+                    new_url = f"{current_url}{params}"
 
-        if new_url == current_url:
-            return False
+                if new_url == current_url:
+                    continue
 
-        self.logger.info(f"Navigating directly to directory view: {new_url}")
-        try:
-            page.goto(new_url, wait_until="domcontentloaded", timeout=15000)
-            self.logger.info(f"Directory view navigation completed: {page.url}")
-            # Wait for directory content to load
-            page.wait_for_timeout(5000)
-            self._debug_dump(page, label="state-directory-direct")
-            return True
-        except Exception as exc:
-            self.logger.warning(f"Failed to navigate to directory view: {exc}")
-            return False
+                self.logger.info(f"[EXPERIMENT] Testing directory params '{params}': {new_url}")
+
+                # Navigate with the new parameters
+                page.goto(new_url, wait_until="domcontentloaded", timeout=10000)
+
+                # Check if navigation succeeded and directory content is present
+                final_url = page.url
+                content = page.content().lower()
+
+                # Check for directory indicators
+                has_directory = (
+                    "directory" in content or
+                    "aria-label" in content and "directory" in content or
+                    any(selector in content for selector in ["directory", "k7jAl", "miFGmb"])
+                )
+
+                if has_directory:
+                    self.logger.info(f"[EXPERIMENT] SUCCESS with '{params}' - directory content detected")
+                    self.logger.info(f"[EXPERIMENT] Final URL: {final_url}")
+
+                    # Wait for content to stabilize
+                    page.wait_for_timeout(3000)
+                    self._debug_dump(page, label=f"state-directory-{params.replace('!', '')}")
+                    return True
+                else:
+                    self.logger.info(f"[EXPERIMENT] FAILED with '{params}' - no directory content detected")
+                    # Continue to next parameter combination
+                    continue
+
+            except Exception as exc:
+                self.logger.warning(f"[EXPERIMENT] Failed with '{params}': {exc}")
+                continue
+
+        # If no combination worked, fall back to original URL
+        self.logger.warning("[EXPERIMENT] No parameter combination successfully activated directory view")
+        return False
 
     def _extract_brands_from_directory(self, page) -> List[str]:
         """Extract brand names from the Google Maps directory."""
@@ -1072,8 +1110,9 @@ class GoogleMapsBrandScraper:
         current_url = page.url
         self.logger.info(f"[EXTRACTION] Starting extraction on URL: {current_url}")
 
-        # URL manipulation approach - directory should already be expanded via !10e3!16s parameters
-        self.logger.info("[EXTRACTION] Relying on URL manipulation (!10e3!16s) for directory expansion")
+        # Pure URL manipulation approach - directory should already be expanded via URL parameters
+        # No UI interaction (clicking "View all") in this experimental branch
+        self.logger.info("[EXTRACTION] Pure URL manipulation approach - no UI interaction for directory expansion")
         self._debug_dump(page, label="state-directory-ready")
 
         # Brief wait for any dynamic content to settle after URL-based directory activation
