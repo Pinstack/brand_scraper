@@ -142,3 +142,7 @@ Thumbs.db
 *.json
 .gmaps_session/
 .playwright-mcp/
+
+# Debug files and temporary artifacts
+debug_*.html
+debug_*.png

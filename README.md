@@ -91,9 +91,9 @@ python google_maps_brand_scraper.py "https://maps.app.goo.gl/FsGevWWrjvab4tZ9A" 
 
 1. **Navigation**: Opens the provided Google Maps URL in a headless Chromium browser
 2. **Consent Handling**: Automatically detects and accepts Google consent/privacy pages
-3. **View All Click**: Uses multiple strategies to find and click the "View all" button that expands the directory
+3. **View All Click**: Uses prioritized locators with retries to expand the directory reliably
 4. **Content Loading**: Waits for dynamic content to load after clicking "View all"
-5. **Brand Extraction**: Scans the page for clickable elements containing brand/store names
+5. **Brand Extraction**: Parses the list container with BeautifulSoup to extract brand metadata (name, category, floor)
 6. **Intelligent Filtering**: Applies comprehensive filtering to exclude UI elements, navigation items, and irrelevant text
 7. **Deduplication**: Removes duplicate brand names
 8. **Results Output**: Returns sorted list of unique brand names

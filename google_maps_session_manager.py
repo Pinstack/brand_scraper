@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +48,8 @@ class GoogleMapsSessionManager:
         user_data_dir: Optional[str] = None,
         proxy_manager: Optional[ProxyManager] = None,
         max_auth_attempts: int = 2,
+        record_har: bool = False,
+        har_output_dir: Optional[str] = None,
     ):
         """Initialise the session manager."""
         self.headless = headless
@@ -59,6 +62,13 @@ class GoogleMapsSessionManager:
         self._current_proxy_info = None
         self.max_auth_attempts = max_auth_attempts
         self._recaptcha_detected = False
+        self.record_har = record_har
+        if record_har:
+            output_dir = Path(har_output_dir or "debug/har")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.har_output_dir = output_dir
+        else:
+            self.har_output_dir = None
 
         if not self.logger.handlers:
             handler = logging.StreamHandler()
@@ -70,6 +80,7 @@ class GoogleMapsSessionManager:
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+        self._active_har_path: Optional[Path] = None
 
     def get_authenticated_page(self, target_url: Optional[str] = None) -> Page:
         """Return a page that is navigated to ``target_url`` with consent handled."""
@@ -118,14 +129,25 @@ class GoogleMapsSessionManager:
                     ],
                 )
 
-                self._context = self._browser.new_context(
-                    user_agent=(
+                context_kwargs = {
+                    "user_agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                     ),
-                    locale="en-GB",
-                    timezone_id="Europe/London",
-                )
+                    "locale": "en-GB",
+                    "timezone_id": "Europe/London",
+                }
+
+                if self.record_har and self.har_output_dir:
+                    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                    har_name = f"session_{timestamp}.har"
+                    har_path = self.har_output_dir / har_name
+                    context_kwargs["record_har_path"] = str(har_path)
+                    context_kwargs["record_har_mode"] = "full"
+                    self._active_har_path = har_path
+                    self.logger.info("Recording HAR to %s", har_path)
+
+                self._context = self._browser.new_context(**context_kwargs)
 
                 page = self._context.new_page()
                 self.logger.info("Navigating to: %s", target_url)
@@ -162,32 +184,58 @@ class GoogleMapsSessionManager:
         """Original persistent-session flow used when no proxy manager is supplied."""
         self._start_browser()
 
-        if self._is_authenticated():
-            self.logger.info("Using existing authenticated session")
-        else:
-            self.logger.info("Setting up new authenticated session")
-            last_error = None
-            for attempt in range(self.max_auth_attempts):
-                try:
-                    self._setup_authentication()
-                    last_error = None
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    self.logger.warning("Auth attempt %s/%s failed: %s", attempt + 1, self.max_auth_attempts, exc)
-                    try:
-                        self.cleanup()
-                    except Exception:
-                        pass
-                    self._start_browser()
-            if last_error:
-                raise last_error
+        page: Optional[Page]
+        page_reused = False
 
-        page = self._context.new_page()
+        if self._storage_state_is_fresh():
+            self.logger.info("Using fresh storage state; skipping auth check")
+            page = self._context.new_page()
+        else:
+            page = self._is_authenticated()
+
+            if page:
+                self.logger.info("Using existing authenticated session")
+                page_reused = True
+            else:
+                self.logger.info("Setting up new authenticated session")
+                last_error = None
+                for attempt in range(self.max_auth_attempts):
+                    try:
+                        page = self._setup_authentication()
+                        page_reused = True
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        self.logger.warning(
+                            "Auth attempt %s/%s failed: %s",
+                            attempt + 1,
+                            self.max_auth_attempts,
+                            exc,
+                        )
+                        try:
+                            self.cleanup()
+                        except Exception:
+                            pass
+                        self._start_browser()
+                if last_error:
+                    raise last_error
+                if page is None or page.is_closed():
+                    page = self._context.new_page()
+
+        if page is None:
+            page = self._context.new_page()
+        reusable_page = page if page_reused else None
+
         try:
             self._setup_consent_handler(page)
-            self.logger.info("Navigating to target URL %s", target_url)
-            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+
+        try:
+            if page.url != target_url:
+                self.logger.info("Navigating to target URL %s", target_url)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             if "consent.google.com" in page.url:
                 self.logger.info("Consent page detected after navigation")
                 self._handle_consent_flow(page)
@@ -199,7 +247,13 @@ class GoogleMapsSessionManager:
                     pass
         except Exception as exc:
             self.logger.error("Failed to load target URL %s: %s", target_url, exc)
+            if reusable_page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
             raise
+
         return page
 
     def _handle_consent_simple(self, page: Page):
@@ -267,18 +321,39 @@ class GoogleMapsSessionManager:
         )
 
         storage_state = self.storage_state_path if self.storage_state_path.exists() else None
-
-        self._context = self._browser.new_context(
-            storage_state=str(storage_state) if storage_state else None,
-            user_agent=(
+        context_kwargs = {
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
-            locale="en-GB",
-            timezone_id="Europe/London",
-        )
+            "locale": "en-GB",
+            "timezone_id": "Europe/London",
+        }
 
-    def _is_authenticated(self) -> bool:
+        if storage_state:
+            context_kwargs["storage_state"] = str(storage_state)
+
+        if self.record_har and self.har_output_dir:
+            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            har_name = f"session_{timestamp}.har"
+            har_path = self.har_output_dir / har_name
+            context_kwargs["record_har_path"] = str(har_path)
+            context_kwargs["record_har_mode"] = "full"
+            self._active_har_path = har_path
+            self.logger.info("Recording HAR to %s", har_path)
+
+        self._context = self._browser.new_context(**context_kwargs)
+
+    def _storage_state_is_fresh(self, max_age_seconds: int = 3600) -> bool:
+        try:
+            if not self.storage_state_path.exists():
+                return False
+            age = time.time() - self.storage_state_path.stat().st_mtime
+            return age < max_age_seconds
+        except Exception:
+            return False
+
+    def _is_authenticated(self) -> Optional[Page]:
         page: Optional[Page] = None
         try:
             page = self._context.new_page()
@@ -301,21 +376,24 @@ class GoogleMapsSessionManager:
             if self.proxy_manager and self._current_proxy_info:
                 self.proxy_manager.record_success(self._current_proxy_info)
 
-            return True
+            return page
 
         except Exception as exc:
             self.logger.debug("Authentication check failed: %s", exc)
             if self.proxy_manager and self._current_proxy_info:
                 self.proxy_manager.record_failure(self._current_proxy_info)
-            return False
-        finally:
             if page:
                 try:
                     page.close()
                 except Exception:
                     pass
+            return None
+        finally:
+            if page:
+                if page.is_closed():
+                    return None
 
-    def _setup_authentication(self):
+    def _setup_authentication(self) -> Page:
         self.logger.info("Setting up Google authentication...")
         page = self._context.new_page()
 
@@ -335,12 +413,16 @@ class GoogleMapsSessionManager:
                 raise Exception("Recaptcha detected during authentication")
 
             self.logger.info("Authentication setup complete")
+            return page
 
         except Exception as exc:
             self.logger.error("Authentication setup failed: %s", exc)
+            try:
+                if not page.is_closed():
+                    page.close()
+            except Exception:
+                pass
             raise
-        finally:
-            page.close()
 
     def _setup_consent_handler(self, page: Page):
         try:
