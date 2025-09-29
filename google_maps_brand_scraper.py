@@ -16,12 +16,15 @@ Usage:
     brands = scraper.scrape_brands("https://maps.app.goo.gl/FsGevWWrjvab4tZ9A")
 """
 
+import base64
+import gzip
 import logging
 import re
 import time
 import json
-import base64
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.sync_api import sync_playwright, Browser, TimeoutError as PlaywrightTimeoutError
 from google_maps_session_manager import GoogleMapsSessionManager
@@ -73,6 +76,24 @@ CTA_EXCLUSION_NAMES = {
     "call",
     "directions",
 }
+
+
+def _normalize_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return (url or "").rstrip("/")
+
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    normalized_query = urlencode(sorted(query_pairs)) if query_pairs else ""
+    cleaned = parsed._replace(query=normalized_query, fragment="")
+    return urlunparse(cleaned).rstrip("/")
+
+
+def _urls_equivalent(url_a: str, url_b: str) -> bool:
+    if not url_a or not url_b:
+        return False
+    return _normalize_url(url_a) == _normalize_url(url_b)
 
 
 def activate_directory_tab(
@@ -198,44 +219,74 @@ class PbDirectoryCollector:
 
 def _load_pb_payloads_from_har(context, *, logger=None) -> List[Dict[str, Optional[str]]]:
     logger = logger or logging.getLogger(__name__)
-    payloads: List[str] = []
+    har_path_value = getattr(context, "_recorded_har_path", None)
+    if not har_path_value:
+        return []
 
     try:
-        har_traces = getattr(context, "_har_traces", None)
-        if not har_traces:
-            return []
+        har_path = Path(har_path_value)
+    except TypeError:
+        logger.debug("Invalid HAR path reference: %s", har_path_value)
+        return []
 
-        for har_entry in har_traces.values():
-            try:
-                for record in har_entry.get("entries", []):
-                    request = record.get("request", {})
-                    response = record.get("response", {})
-                    url = request.get("url")
-                    if not url or "pb=" not in url:
-                        continue
-                    status = response.get("status")
-                    if status not in (200, 204):
-                        continue
-                    content = response.get("content", {})
-                    text = content.get("text")
-                    if not text:
-                        continue
-                    if content.get("encoding") == "base64":
-                        try:
-                            decoded = base64.b64decode(text).decode("utf-8", errors="ignore")
-                        except Exception:
-                            continue
-                        payloads.append(decoded)
-                    else:
-                        payloads.append(text)
-            except Exception as exc:
-                logger.debug("Failed to parse HAR entry: %s", exc)
+    if not har_path.exists():
+        logger.debug("HAR file %s not found; skipping PB extraction", har_path)
+        return []
+
+    try:
+        with har_path.open("r", encoding="utf-8") as handle:
+            har_data = json.load(handle)
     except Exception as exc:
-        logger.debug("Error while accessing HAR traces: %s", exc)
+        logger.debug("Failed to load HAR file %s: %s", har_path, exc)
+        return []
+
+    entries = har_data.get("log", {}).get("entries", [])
+    payloads: List[str] = []
+
+    for record in entries:
+        try:
+            request = record.get("request", {})
+            response = record.get("response", {})
+            url = request.get("url")
+            if not url or "pb=" not in url:
+                continue
+
+            status = response.get("status")
+            if status not in (200, 204):
+                continue
+
+            content = response.get("content", {})
+            text = content.get("text")
+            if not text or status == 204:
+                continue
+
+            encoding = (content.get("encoding") or "").lower()
+            if encoding == "base64":
+                try:
+                    raw_bytes = base64.b64decode(text)
+                except Exception as exc:
+                    logger.debug("Failed to base64 decode HAR payload: %s", exc)
+                    continue
+                try:
+                    raw_bytes = gzip.decompress(raw_bytes)
+                except OSError:
+                    pass
+                decoded = raw_bytes.decode("utf-8", errors="ignore")
+            else:
+                decoded = text
+
+            if len(decoded) < 3:
+                continue
+
+            payloads.append(decoded)
+        except Exception as exc:
+            logger.debug("Failed to process HAR record: %s", exc)
+
+    if not payloads:
+        return []
 
     collector = PbDirectoryCollector(logger=logger)
-    for payload in payloads:
-        collector._payloads.append(payload)
+    collector._payloads.extend(payloads)
     return collector.extract_cards()
 
     def _extract_cards_from_payload(self, payload) -> List[Dict[str, Optional[str]]]:
@@ -608,16 +659,17 @@ def scroll_directory_until_complete(
     container_selector,
     *,
     logger=None,
-    max_empty_scrolls: int = 4,
+    max_empty_scrolls: int = 6,
     max_total_scrolls: Optional[int] = None,
     wait_between_scrolls_ms: int = 300,
     pb_payload_threshold: int = 200,
     idle_scroll_threshold: int = 3,
+    pb_sentinel_streak_threshold: int = 2,
+    min_total_scrolls: int = 2,
     on_iteration=None,
     pb_collector: Optional[PbDirectoryCollector] = None,
-    collect_pb_bodies: bool = True,
 ) -> ScrollTelemetry:
-    """Scroll the directory container until no new cards appear or pb sentinel observed."""
+    """Scroll the directory container until no new cards appear or responses stall."""
 
     logger = logger or logging.getLogger(__name__)
 
@@ -661,18 +713,13 @@ def scroll_directory_until_complete(
         except Exception:
             pass
 
-    pb_triggered = False
+    pb_sentinel_flag = False
+    pb_sentinel_hits = 0
+    pb_sentinel_streak = 0
     responses = 0
 
-    if collect_pb_bodies:
-        existing = set()
-        try:
-            existing = set(page.context._har_traces.keys())  # type: ignore[attr-defined]
-        except Exception:
-            collect_pb_bodies = False
-
     def _on_response(response):
-        nonlocal pb_triggered, responses
+        nonlocal pb_sentinel_flag, pb_sentinel_hits, responses
         responses += 1
         url = getattr(response, "url", "")
         status = getattr(response, "status", None)
@@ -688,7 +735,8 @@ def scroll_directory_until_complete(
                 except ValueError:
                     content_length = None
             if status == 204 or (content_length is not None and content_length < pb_payload_threshold):
-                pb_triggered = True
+                pb_sentinel_flag = True
+                pb_sentinel_hits += 1
         if pb_collector is not None:
             try:
                 pb_collector.on_response(response)
@@ -735,6 +783,12 @@ def scroll_directory_until_complete(
                 idle_scrolls = 0
                 last_scroll_height = current_height
 
+            if pb_sentinel_flag:
+                pb_sentinel_streak += 1
+            else:
+                pb_sentinel_streak = 0
+            pb_sentinel_flag = False
+
             if callable(on_iteration):
                 try:
                     on_iteration()
@@ -742,20 +796,31 @@ def scroll_directory_until_complete(
                     logger.debug("Iteration callback raised %s", iteration_exc)
 
             logger.debug(
-                "Scroll iteration %s: child_count=%s height=%s empty=%s idle=%s",
+                "Scroll iteration %s: child_count=%s height=%s empty=%s idle=%s sentinel=%s",
                 total_scrolls,
                 current_child_count,
                 current_height,
                 empty_scrolls,
                 idle_scrolls,
+                pb_sentinel_streak,
             )
 
-            if pb_triggered or empty_scrolls >= max_empty_scrolls or idle_scrolls >= idle_scroll_threshold:
-                break
+            if total_scrolls >= max(min_total_scrolls, 1):
+                if (
+                    pb_sentinel_streak >= max(pb_sentinel_streak_threshold, 1)
+                    and idle_scrolls >= idle_scroll_threshold
+                ):
+                    break
+                if empty_scrolls >= max_empty_scrolls and idle_scrolls >= idle_scroll_threshold:
+                    break
+                if idle_scrolls >= idle_scroll_threshold and current_child_count == last_child_count:
+                    break
+                if max_total_scrolls is not None and total_scrolls >= max_total_scrolls:
+                    break
 
         telemetry.scrolls_performed = total_scrolls
         telemetry.final_card_count = last_child_count
-        telemetry.pb_sentinel_triggered = pb_triggered
+        telemetry.pb_sentinel_triggered = pb_sentinel_hits > 0
         telemetry.responses_observed = responses
         telemetry.cards_collected = None
         return telemetry
@@ -838,7 +903,14 @@ class GoogleMapsBrandScraper:
     brand extraction logic.
     """
 
-    def __init__(self, headless: bool = False, timeout: int = 30000, use_proxies: bool = False, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(
+        self,
+        headless: bool = False,
+        timeout: int = 30000,
+        use_proxies: bool = False,
+        proxy_manager: Optional[ProxyManager] = None,
+        enable_debug_dumps: bool = False,
+    ):
         """
         Initialize the brand scraper.
 
@@ -852,6 +924,7 @@ class GoogleMapsBrandScraper:
         self.use_proxies = use_proxies
         self.proxy_manager = proxy_manager
         self._debug_event_counter = 0
+        self.enable_debug_dumps = enable_debug_dumps
 
         if not hasattr(self, "_debug_dump"):
             self._debug_dump = lambda *args, **kwargs: None
@@ -863,6 +936,9 @@ class GoogleMapsBrandScraper:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+
+        if self.logger.isEnabledFor(logging.DEBUG) and not enable_debug_dumps:
+            self.enable_debug_dumps = True
 
     def scrape_brands(self, url: str) -> List[str]:
         """
@@ -918,38 +994,38 @@ class GoogleMapsBrandScraper:
 
             self._debug_dump(page, label="post-auth")
 
-            # Avoid redundant navigation when proxy flow already loads target page
+            current_url = getattr(page, "url", "") or ""
+            already_on_target = _urls_equivalent(current_url, url)
+
+            if already_on_target:
+                self.logger.info("Page already at target URL; reusing existing navigation")
+
             should_navigate = (
-                not self.use_proxies
-                or not getattr(page, "url", None)
-                or page.url in {"about:blank", ""}
-                or "consent.google.com" in page.url
+                not already_on_target
+                or current_url in {"about:blank", ""}
+                or "consent.google.com" in current_url
             )
 
             if should_navigate:
+                self.logger.info("Navigating page to %s", url)
                 page.goto(url, wait_until="domcontentloaded")
                 self._debug_dump(page, label="post-goto")
-                self._ensure_directory_view(page)
 
             # Handle scenarios where navigation sends us back to consent page
             if "consent.google.com" in page.url:
                 self.logger.info("Redirected to consent page after navigation; re-running consent handler")
                 session_manager._handle_consent_flow(page)
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(2000)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(1000)
                 if "consent.google.com" in page.url:
                     raise RuntimeError("Unable to pass consent page after retry")
             else:
+                self._ensure_directory_view(page)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=self.timeout)
+                    page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout, 5000))
                 except PlaywrightTimeoutError:
-                    self.logger.warning("Network idle state not reached within %sms; continuing", self.timeout)
-                finally:
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except PlaywrightTimeoutError:
-                        self.logger.debug("DOM content load wait also timed out; proceeding regardless")
-                page.wait_for_timeout(2000)
+                    self.logger.debug("DOM content load wait timed out; continuing")
+                page.wait_for_timeout(750)
 
             # Extract brands from the directory
             brands = self._extract_brands_from_directory(page)
@@ -1002,13 +1078,12 @@ class GoogleMapsBrandScraper:
         else:
             self._debug_dump(page, label="state-directory-tab-active")
 
-        # Click "View all" to expand the directory
-        if not _click_view_all_button(page, logger=self.logger):
-            self.logger.warning("Could not click View all button - may not have directory")
-            self._debug_dump(page, label="state-view-all-missing")
-            return []
-
-        self._debug_dump(page, label="state-view-all-clicked")
+        # Click "View all" when available but continue gracefully if absent
+        view_all_clicked = _click_view_all_button(page, logger=self.logger)
+        if view_all_clicked:
+            self._debug_dump(page, label="state-view-all-clicked")
+        else:
+            self.logger.info("View all button not present; proceeding with visible directory")
 
         collected_cards: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Optional[str]]] = {}
 
@@ -1032,11 +1107,10 @@ class GoogleMapsBrandScraper:
             page,
             DIRECTORY_CONTAINER_SELECTORS,
             logger=self.logger,
-            max_empty_scrolls=4,
+            max_empty_scrolls=6,
             wait_between_scrolls_ms=400,
             on_iteration=_capture_cards,
             pb_collector=pb_collector,
-            collect_pb_bodies=True,
         )
         self.logger.info(
             "Scroll telemetry - scrolls: %s, responses: %s, pb_sentinel: %s",
@@ -1110,6 +1184,11 @@ class GoogleMapsBrandScraper:
         return filename
 
     def _debug_dump(self, page, label: str):
+        if not getattr(self, "enable_debug_dumps", False):
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("Debug dump for %s skipped (disabled)", label)
+            return
+
         safe_label = self._sanitize_label(label)
         self._debug_event_counter += 1
         prefix = f"{self._debug_event_counter:03d}_{safe_label}"

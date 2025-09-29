@@ -20,6 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from playwright.sync_api import (
     sync_playwright,
@@ -233,18 +234,21 @@ class GoogleMapsSessionManager:
             pass
 
         try:
-            if page.url != target_url:
+            current_url = getattr(page, "url", "") or ""
+            if not self._urls_equivalent(current_url, target_url):
                 self.logger.info("Navigating to target URL %s", target_url)
                 page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            else:
+                self.logger.debug("Target URL %s already loaded; skipping navigation", target_url)
             if "consent.google.com" in page.url:
                 self.logger.info("Consent page detected after navigation")
                 self._handle_consent_flow(page)
             else:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                    page.wait_for_timeout(1000)
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
                 except TimeoutError:
-                    pass
+                    self.logger.debug("DOM content load wait timed out; continuing")
+                page.wait_for_timeout(750)
         except Exception as exc:
             self.logger.error("Failed to load target URL %s: %s", target_url, exc)
             if reusable_page:
@@ -343,6 +347,8 @@ class GoogleMapsSessionManager:
             self.logger.info("Recording HAR to %s", har_path)
 
         self._context = self._browser.new_context(**context_kwargs)
+        if self._active_har_path:
+            setattr(self._context, "_recorded_har_path", str(self._active_har_path))
 
     def _storage_state_is_fresh(self, max_age_seconds: int = 3600) -> bool:
         try:
@@ -352,6 +358,23 @@ class GoogleMapsSessionManager:
             return age < max_age_seconds
         except Exception:
             return False
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return (url or "").rstrip("/")
+
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        normalized_query = urlencode(sorted(query_pairs)) if query_pairs else ""
+        cleaned = parsed._replace(query=normalized_query, fragment="")
+        return urlunparse(cleaned).rstrip("/")
+
+    def _urls_equivalent(self, current_url: str, target_url: str) -> bool:
+        if not current_url or not target_url:
+            return False
+        return self._normalize_url(current_url) == self._normalize_url(target_url)
 
     def _is_authenticated(self) -> Optional[Page]:
         page: Optional[Page] = None
@@ -369,9 +392,9 @@ class GoogleMapsSessionManager:
                 return False
 
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
             except TimeoutError:
-                pass
+                self.logger.debug("DOM content load wait during auth check timed out")
 
             if self.proxy_manager and self._current_proxy_info:
                 self.proxy_manager.record_success(self._current_proxy_info)
