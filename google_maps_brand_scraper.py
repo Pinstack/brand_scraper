@@ -1001,6 +1001,9 @@ class GoogleMapsBrandScraper:
                         self.logger.debug("Page load wait timed out; proceeding regardless")
                 page.wait_for_timeout(1200)
 
+            # NOW add directory parameters after consent is handled
+            self._ensure_directory_view(page)
+
             # Extract brands from the directory
             brands = self._extract_brands_from_directory(page)
 
@@ -1018,6 +1021,13 @@ class GoogleMapsBrandScraper:
                     page.off("framenavigated", nav_handler)
                 except Exception:
                     pass
+
+    def _add_directory_parameters(self, url: str) -> str:
+        """Add directory view parameters to URL before navigation."""
+        # For short Google Maps URLs, we can't predict the final URL
+        # So we'll add parameters after the first navigation/redirect
+        # For now, return the original URL - parameters will be added after redirect
+        return url
 
     def _ensure_directory_view(self, page):
         """Navigate directly to directory view by adding !10e3!16s parameters."""
@@ -1062,17 +1072,12 @@ class GoogleMapsBrandScraper:
         current_url = page.url
         self.logger.info(f"[EXTRACTION] Starting extraction on URL: {current_url}")
 
-        # Try to expand directory by clicking "View all" buttons
-        view_all_clicked = _click_view_all_button(page, logger=self.logger)
-        if view_all_clicked:
-            self.logger.info("[EXTRACTION] View all button clicked successfully")
-            self._debug_dump(page, label="state-view-all-clicked")
-            # Wait for directory to expand
-            page.wait_for_timeout(3000)
-        else:
-            self.logger.warning("[EXTRACTION] No View all button found")
-
+        # URL manipulation approach - directory should already be expanded via !10e3!16s parameters
+        self.logger.info("[EXTRACTION] Relying on URL manipulation (!10e3!16s) for directory expansion")
         self._debug_dump(page, label="state-directory-ready")
+
+        # Brief wait for any dynamic content to settle after URL-based directory activation
+        page.wait_for_timeout(1000)
 
         collected_cards: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Optional[str]]] = {}
 
